@@ -158,6 +158,7 @@ public:
     virtual int RKU_DeviceRequest(DWORD dwRequest, BYTE *lpBuffer, DWORD dwDataSize);
 	CRKUsbComm(STRUCT_RKDEVICE_DESC devDesc, CRKLog *pLog, bool &bRet);
 	virtual ~CRKUsbComm();
+	int GetUsbError() { return m_usbError; }	/* libusb error of the failed InitializeUsb */
     virtual bool Reset_Usb_Config(STRUCT_RKDEVICE_DESC devDesc);
 	virtual bool Reset_Usb_Device();
 	virtual int RKU_EraseLBA(DWORD dwPos,DWORD dwCount);
@@ -166,6 +167,7 @@ private:
 	unsigned char m_pipeBulkIn;
 	unsigned char m_pipeBulkOut;
 	int m_interfaceNum;
+	int m_usbError;
 	virtual bool RKU_Write(BYTE *lpBuffer, DWORD dwSize);
 	virtual bool RKU_Read(BYTE *lpBuffer, DWORD dwSize);
 	bool InitializeUsb(STRUCT_RKDEVICE_DESC devDesc);

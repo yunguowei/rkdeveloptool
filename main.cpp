@@ -7,6 +7,8 @@
 
 #include   <unistd.h>
 #include   <dirent.h>
+#include   <strings.h>
+#include   <ctype.h>
 #include "config.h"
 #include "DefineHeader.h"
 #include "gpt.h"
@@ -47,6 +49,8 @@ void usage()
 	printf("ListDevice:\t\tld\r\n");
 	printf("DownloadBoot:\t\tdb <Loader>\r\n");
 	printf("UpgradeLoader:\t\tul <Loader>\r\n");
+	printf("UpgradeFirmware:\tuf <update.img>\r\n");
+	printf("ParseUpdateImage:\tafp <update.img>\r\n");
 	printf("ReadLBA:\t\trl  <BeginSec> <SectorLen> <File>\r\n");
 	printf("WriteLBA:\t\twl  <BeginSec> <File>\r\n");
 	printf("WriteLBA:\t\twlx  <PartitionName> <File>\r\n");
@@ -824,6 +828,22 @@ bool check_device_type(STRUCT_RKDEVICE_DESC &dev, UINT uiSupportType)
 		return false;
 	}
 }
+/*
+ * Report why a CRKUsbComm could not be created (no trailing newline).
+ * libusb errors stay hidden in the log otherwise, which makes the plain
+ * "Creating Comm Object failed!" useless for permission problems.
+ */
+static void print_usb_comm_failure(CRKComm *pComm)
+{
+	int err = pComm ? ((CRKUsbComm *)pComm)->GetUsbError() : 0;
+
+	printf("Creating Comm Object failed!");
+	if (err == LIBUSB_ERROR_ACCESS)
+		printf(", no permission to open the rockusb device"
+		       " (install 99-rk-rockusb.rules or run as root)");
+	else if (err)
+		printf(", libusb error %d (%s)", err, libusb_error_name(err));
+}
 bool MakeParamBuffer(char *pParamFile, char* &pParamData)
 {
 	FILE *file=NULL;
@@ -878,7 +898,7 @@ bool write_parameter(STRUCT_RKDEVICE_DESC &dev, char *szParameter)
 	pComm = new CRKUsbComm(dev, g_pLogObject, bRet);
 	if (!bRet) {
 		ERROR_COLOR_ATTR;
-		printf("Creating Comm Object failed!");
+		print_usb_comm_failure(pComm);
 		NORMAL_COLOR_ATTR;
 		printf("\r\n");
 		return bSuccess;
@@ -933,7 +953,7 @@ bool write_gpt(STRUCT_RKDEVICE_DESC &dev, char *szParameter)
 	pComm = new CRKUsbComm(dev, g_pLogObject, bRet);
 	if (!bRet) {
 		ERROR_COLOR_ATTR;
-		printf("Creating Comm Object failed!");
+		print_usb_comm_failure(pComm);
 		NORMAL_COLOR_ATTR;
 		printf("\r\n");
 		return bSuccess;
@@ -1787,7 +1807,7 @@ bool download_boot(STRUCT_RKDEVICE_DESC &dev, char *szLoader)
 			if (pImage)
 				delete pImage;
 			ERROR_COLOR_ATTR;
-			printf("Creating Comm Object failed!");
+			print_usb_comm_failure(pComm);
 			NORMAL_COLOR_ATTR;
 			printf("\r\n");
 			return bSuccess;
@@ -1828,7 +1848,7 @@ bool download_boot(STRUCT_RKDEVICE_DESC &dev, char *szLoader)
 }
 bool upgrade_loader(STRUCT_RKDEVICE_DESC &dev, char *szLoader)
 {
-	if (!check_device_type(dev, RKUSB_MASKROM))
+	if (!check_device_type(dev, RKUSB_MASKROM | RKUSB_LOADER))
 		return false;
 	CRKImage *pImage = NULL;
 	CRKBoot *pBoot = NULL;
@@ -1860,7 +1880,7 @@ bool upgrade_loader(STRUCT_RKDEVICE_DESC &dev, char *szLoader)
 		pComm = new CRKUsbComm(dev, g_pLogObject, bRet);
 		if (!bRet) {
 			ERROR_COLOR_ATTR;
-			printf("Creating Comm Object failed!");
+			print_usb_comm_failure(pComm);
 			NORMAL_COLOR_ATTR;
 			printf("\r\n");
 			goto Exit_UpgradeLoader;
@@ -2045,7 +2065,7 @@ bool print_gpt(STRUCT_RKDEVICE_DESC &dev)
 	pComm = new CRKUsbComm(dev, g_pLogObject, bRet);
 	if (!bRet) {
 		ERROR_COLOR_ATTR;
-		printf("Creating Comm Object failed!");
+		print_usb_comm_failure(pComm);
 		NORMAL_COLOR_ATTR;
 		printf("\r\n");
 		return bSuccess;
@@ -2097,7 +2117,7 @@ bool print_parameter(STRUCT_RKDEVICE_DESC &dev)
 	pComm = new CRKUsbComm(dev, g_pLogObject, bRet);
 	if (!bRet) {
 		ERROR_COLOR_ATTR;
-		printf("Creating Comm Object failed!");
+		print_usb_comm_failure(pComm);
 		NORMAL_COLOR_ATTR;
 		printf("\r\n");
 		return bSuccess;
@@ -2155,7 +2175,7 @@ bool erase_flash(STRUCT_RKDEVICE_DESC &dev)
 		if (pScan)
 			delete pScan;
 		ERROR_COLOR_ATTR;
-		printf("Creating Comm Object failed!");
+		print_usb_comm_failure(pComm);
 		NORMAL_COLOR_ATTR;
 		printf("\r\n");
 		return bSuccess;
@@ -2987,6 +3007,460 @@ Exit_WriteLBA:
 	return bSuccess;
 }
 
+/*
+ * RKAF inner firmware package (the blob carried by an RKFW update.img,
+ * normally produced by afptool -pack):
+ *
+ *   offset 0x00: "RKAF"
+ *   offset 0x04: package size in bytes
+ *   offset 0x08: machine model/id/name strings etc. (not used here)
+ *   offset 0x88: entry count
+ *   offset 0x8C: entry table, 112 bytes per entry:
+ *                name[32], path[32],
+ *                7 reserved u32, flash size (sectors), data offset (bytes),
+ *                flash offset (sectors, -1 = not flashed), update time,
+ *                data size (bytes)
+ */
+#pragma pack(1)
+typedef struct {
+	BYTE szTag[4];		/* "RKAF" */
+	UINT uiImageSize;	/* package size, in bytes */
+	BYTE szReserved[0x80];	/* machine model/id/name, version, md5... */
+	UINT uiEntryCount;
+} STRUCT_RKAF_HEAD, *PSTRUCT_RKAF_HEAD;
+
+typedef struct {
+	char szName[32];
+	char szPath[32];
+	UINT uiReserved[7];
+	UINT uiFlashSize;	/* partition size on flash, in sectors */
+	UINT uiDataOffset;	/* data offset in package, in bytes */
+	UINT uiFlashOffset;	/* flash offset, in sectors, -1 = not flashed */
+	UINT uiUpdateTime;
+	UINT uiDataSize;	/* data size, in bytes */
+} STRUCT_RKAF_ENTRY, *PSTRUCT_RKAF_ENTRY;
+#pragma pack()
+
+typedef std::vector<STRUCT_RKAF_ENTRY> AF_ENTRY_VECTOR;
+
+static bool parse_af_image(FILE *file, long long fwOffset, long long fwSize,
+			   AF_ENTRY_VECTOR &vecEntries)
+{
+	STRUCT_RKAF_HEAD afHead;
+	STRUCT_RKAF_ENTRY afEntry;
+	int i, iRead, j;
+
+	fseeko(file, fwOffset, SEEK_SET);
+	iRead = fread(&afHead, 1, sizeof(afHead), file);
+	if (iRead != sizeof(afHead)) {
+		printf("Read RKAF header failed!\r\n");
+		return false;
+	}
+	if (memcmp(afHead.szTag, "RKAF", 4) != 0) {
+		printf("Not a RKAF firmware package!\r\n");
+		return false;
+	}
+	if ((afHead.uiEntryCount == 0) || (afHead.uiEntryCount > 64)) {
+		printf("RKAF entry count %u is invalid!\r\n", afHead.uiEntryCount);
+		return false;
+	}
+	for (i = 0; i < (int)afHead.uiEntryCount; i++) {
+		iRead = fread(&afEntry, 1, sizeof(afEntry), file);
+		if (iRead != sizeof(afEntry)) {
+			printf("Read RKAF entry %d failed!\r\n", i);
+			return false;
+		}
+		for (j = 0; afEntry.szName[j] && (j < 32); j++) {
+			if (!isprint((unsigned char)afEntry.szName[j])) {
+				printf("RKAF entry %d has invalid name!\r\n", i);
+				return false;
+			}
+		}
+		if (((long long)afEntry.uiDataOffset + (long long)afEntry.uiDataSize) > fwSize) {
+			printf("RKAF entry %s data out of range!\r\n", afEntry.szName);
+			return false;
+		}
+		vecEntries.push_back(afEntry);
+	}
+	return true;
+}
+
+static bool write_lba_offset(STRUCT_RKDEVICE_DESC &dev, UINT uiBegin, FILE *file,
+			     long long offset, long long size)
+{
+	if (!check_device_type(dev, RKUSB_LOADER | RKUSB_MASKROM))
+		return false;
+	CRKUsbComm *pComm = NULL;
+	bool bRet, bFirst = true, bSuccess = false;
+	int iRet;
+	long long iTotalWrite = 0, iChunk;
+	UINT iRead = 0, uiLen;
+	int nSectorSize = 512;
+	BYTE pBuf[nSectorSize * DEFAULT_RW_LBA];
+
+	pComm = new CRKUsbComm(dev, g_pLogObject, bRet);
+	if (!bRet) {
+		printf("Write LBA quit, creating comm object failed!\r\n");
+		return false;
+	}
+	fseeko(file, offset, SEEK_SET);
+	while (iTotalWrite < size) {
+		iChunk = size - iTotalWrite;
+		if (iChunk > (long long)nSectorSize * DEFAULT_RW_LBA)
+			iChunk = (long long)nSectorSize * DEFAULT_RW_LBA;
+		memset(pBuf, 0, nSectorSize * DEFAULT_RW_LBA);
+		iRead = fread(pBuf, 1, iChunk, file);
+		if ((long long)iRead != iChunk) {
+			printf("Read firmware data failed!\r\n");
+			goto Exit_WriteLbaOffset;
+		}
+		uiLen = ((iRead % 512) == 0) ? (iRead / 512) : (iRead / 512 + 1);
+		iRet = pComm->RKU_WriteLBA(uiBegin, uiLen, pBuf);
+		if (ERR_SUCCESS == iRet) {
+			uiBegin += uiLen;
+			iTotalWrite += iRead;
+			if (bFirst) {
+				bFirst = false;
+			} else {
+				CURSOR_MOVEUP_LINE(1);
+				CURSOR_DEL_LINE;
+			}
+			printf("Writing image (%lld%%)\r\n",
+			       (iTotalWrite / 1024) * 100 / ((size + 1023) / 1024));
+		} else {
+			if (g_pLogObject)
+				g_pLogObject->Record("Error: RKU_WriteLBA failed, err=%d", iRet);
+			printf("Write LBA failed!\r\n");
+			goto Exit_WriteLbaOffset;
+		}
+	}
+	bSuccess = true;
+Exit_WriteLbaOffset:
+	if (pComm)
+		delete pComm;
+	return bSuccess;
+}
+
+static bool write_param_data(STRUCT_RKDEVICE_DESC &dev, char *pData, UINT uiSize)
+{
+	if (!check_device_type(dev, RKUSB_LOADER | RKUSB_MASKROM))
+		return false;
+	CRKUsbComm *pComm = NULL;
+	char writeBuf[512 * 1024];
+	UINT iRet, nParamSec, nParamSize;
+	bool bRet, bSuccess = false;
+
+	pComm = new CRKUsbComm(dev, g_pLogObject, bRet);
+	if (!bRet) {
+		print_usb_comm_failure(pComm);
+		printf("\r\n");
+		return false;
+	}
+	if ((uiSize >= 12) && (*(UINT *)pData == 0x4D524150)) {
+		/* already a wrapped PARM buffer, write it as is */
+		nParamSize = uiSize;
+	} else {
+		nParamSize = uiSize + 12;
+	}
+	nParamSec = BYTE2SECTOR(nParamSize);
+	if (nParamSec > 1024) {
+		printf("Parameter is too large!\r\n");
+		goto Exit_WriteParamData;
+	}
+	memset(writeBuf, 0, (size_t)nParamSec * 512);
+	if (nParamSize == uiSize) {
+		memcpy(writeBuf, pData, uiSize);
+	} else {
+		*(UINT *)writeBuf = 0x4D524150;		/* "PARM" */
+		*(UINT *)(writeBuf + 4) = uiSize;
+		memcpy(writeBuf + 8, pData, uiSize);
+		*(UINT *)(writeBuf + 8 + uiSize) = CRC_32((unsigned char *)pData, uiSize);
+	}
+	printf("Writing parameter...\r\n");
+	iRet = pComm->RKU_WriteLBA(0x2000, nParamSec, (BYTE *)writeBuf);
+	if (iRet != ERR_SUCCESS) {
+		printf("Writing parameter failed!\r\n");
+		goto Exit_WriteParamData;
+	}
+	bSuccess = true;
+	printf("Writing parameter succeeded.\r\n");
+Exit_WriteParamData:
+	if (pComm)
+		delete pComm;
+	return bSuccess;
+}
+
+/*
+ * Create and write a GPT from a parameter text (mtdparts + uuid items),
+ * master at LBA 0 and backup at the end of the flash. Used when the
+ * parameter of an update firmware declares "TYPE: GPT".
+ */
+static bool write_gpt_data(STRUCT_RKDEVICE_DESC &dev, char *pData)
+{
+	if (!check_device_type(dev, RKUSB_MASKROM | RKUSB_LOADER))
+		return false;
+	u8 flash_info[SECTOR_SIZE];
+	u8 master_gpt[34 * SECTOR_SIZE], backup_gpt[33 * SECTOR_SIZE];
+	u32 total_size_sector;
+	CRKComm *pComm = NULL;
+	PARAM_ITEM_VECTOR vecItems;
+	CONFIG_ITEM_VECTOR vecUuid;
+	int iRet;
+	bool bRet, bSuccess = false;
+
+	if (!parse_parameter(pData, vecItems, vecUuid)) {
+		printf("Parsing parameter failed!\r\n");
+		return false;
+	}
+	pComm = new CRKUsbComm(dev, g_pLogObject, bRet);
+	if (!bRet) {
+		print_usb_comm_failure(pComm);
+		printf("\r\n");
+		return false;
+	}
+	iRet = pComm->RKU_ReadFlashInfo(flash_info);
+	if (iRet != ERR_SUCCESS) {
+		printf("Reading Flash Info failed!\r\n");
+		goto Exit_WriteGptData;
+	}
+	total_size_sector = *(u32 *)flash_info;
+	printf("Writing gpt...\r\n");
+	create_gpt_buffer(master_gpt, vecItems, vecUuid, total_size_sector);
+	memcpy(backup_gpt, master_gpt + 2 * SECTOR_SIZE, 32 * SECTOR_SIZE);
+	memcpy(backup_gpt + 32 * SECTOR_SIZE, master_gpt + SECTOR_SIZE, SECTOR_SIZE);
+	prepare_gpt_backup(master_gpt, backup_gpt);
+	iRet = pComm->RKU_WriteLBA(0, 34, master_gpt);
+	if (iRet != ERR_SUCCESS) {
+		printf("Writing master gpt failed!\r\n");
+		goto Exit_WriteGptData;
+	}
+	iRet = pComm->RKU_WriteLBA(total_size_sector - 33, 33, backup_gpt);
+	if (iRet != ERR_SUCCESS) {
+		printf("Writing backup gpt failed!\r\n");
+		goto Exit_WriteGptData;
+	}
+	bSuccess = true;
+	printf("Writing gpt succeeded.\r\n");
+Exit_WriteGptData:
+	delete pComm;
+	return bSuccess;
+}
+
+/*
+ * Parse an RKFW update.img: check the outer header via CRKImage, then the
+ * inner RKAF package. On success *ppFile is left open for data reads.
+ */
+static bool parse_update_image(char *szImage, FILE *&file, long long &fwOffset,
+			       long long &fwSize, AF_ENTRY_VECTOR &vecEntries)
+{
+	bool bRet;
+	CRKImage *pImage;
+
+	pImage = new CRKImage(szImage, bRet);
+	if (!bRet) {
+		ERROR_COLOR_ATTR;
+		printf("Opening firmware failed, not a valid RKFW update image!");
+		NORMAL_COLOR_ATTR;
+		printf("\r\n");
+		delete pImage;
+		return false;
+	}
+	fwOffset = pImage->FWOffset;
+	fwSize = pImage->FWSize;
+	delete pImage;
+	file = fopen(szImage, "rb");
+	if (!file) {
+		printf("Can't open file: %s\r\n", szImage);
+		return false;
+	}
+	if (!parse_af_image(file, fwOffset, fwSize, vecEntries)) {
+		fclose(file);
+		file = NULL;
+		return false;
+	}
+	return true;
+}
+
+/*
+ * uf <update.img> -- flash a whole RKFW update firmware, same as the
+ * "upgrade firmware" page of the Windows RKDevTool:
+ *   1. parse the RKFW header and the inner RKAF package;
+ *   2. in maskrom mode, download the embedded loader into RAM first;
+ *   3. write every flashable item at its flash offset;
+ *   4. write the parameter at fixed LBA 0x2000;
+ *   5. write the idblock built from the embedded loader at LBA 64;
+ *   6. reset the device.
+ */
+bool upgrade_fw(STRUCT_RKDEVICE_DESC &dev, char *szImage)
+{
+	if (!check_device_type(dev, RKUSB_MASKROM | RKUSB_LOADER))
+		return false;
+	FILE *file = NULL;
+	AF_ENTRY_VECTOR vecEntries;
+	STRUCT_RKAF_ENTRY *pEntry;
+	char *pParamData = NULL;
+	bool bRet, bSuccess = false;
+	long long fwOffset, fwSize;
+	UINT i;
+
+	if (!parse_update_image(szImage, file, fwOffset, fwSize, vecEntries))
+		return false;
+
+	printf("Parse firmware OK, %d item(s):\r\n", (int)vecEntries.size());
+	for (i = 0; i < (UINT)vecEntries.size(); i++) {
+		pEntry = &vecEntries[i];
+		if (pEntry->uiFlashOffset == 0xFFFFFFFF)
+			printf("  %-12s (data %u bytes, not for flash)\r\n",
+			       pEntry->szName, pEntry->uiDataSize);
+		else
+			printf("  %-12s flash LBA 0x%X, size 0x%X sectors\r\n",
+			       pEntry->szName, pEntry->uiFlashOffset, pEntry->uiFlashSize);
+	}
+
+	/* 1. download the embedded loader when device is in maskrom */
+	if (dev.emUsbType == RKUSB_MASKROM) {
+		if (!download_boot(dev, szImage))
+			goto Exit_UpgradeFw;
+		/* the device re-enumerates as a loader device after download boot */
+		CRKScan *pScan = new CRKScan();
+		STRUCT_RKDEVICE_DESC devLoader = dev;
+		if (!pScan->Wait(devLoader, RKUSB_LOADER)) {
+			printf("Waiting for loader device failed!\r\n");
+			delete pScan;
+			goto Exit_UpgradeFw;
+		}
+		delete pScan;
+		dev = devLoader;
+	}
+
+	/* 2. write each flashable item at its flash offset */
+	for (i = 0; i < (UINT)vecEntries.size(); i++) {
+		pEntry = &vecEntries[i];
+		if ((pEntry->uiFlashOffset == 0xFFFFFFFF) || (pEntry->uiDataSize == 0))
+			continue;
+		if (strcasecmp(pEntry->szName, "parameter") == 0)
+			continue;	/* written below at fixed LBA 0x2000 */
+		printf("Writing %s to LBA 0x%X...\r\n", pEntry->szName, pEntry->uiFlashOffset);
+		if (!write_lba_offset(dev, pEntry->uiFlashOffset, file,
+				      fwOffset + (long long)pEntry->uiDataOffset,
+				      (long long)pEntry->uiDataSize))
+			goto Exit_UpgradeFw;
+	}
+
+	/* 3. write parameter (and gpt when the parameter declares gpt layout) */
+	for (i = 0; i < (UINT)vecEntries.size(); i++) {
+		pEntry = &vecEntries[i];
+		if (strcasecmp(pEntry->szName, "parameter") != 0)
+			continue;
+		pParamData = new char[pEntry->uiDataSize];
+		if (!pParamData) {
+			printf("Allocating memory failed!\r\n");
+			goto Exit_UpgradeFw;
+		}
+		fseeko(file, fwOffset + (long long)pEntry->uiDataOffset, SEEK_SET);
+		if (fread(pParamData, 1, pEntry->uiDataSize, file) != pEntry->uiDataSize) {
+			printf("Read parameter data failed!\r\n");
+			goto Exit_UpgradeFw;
+		}
+		char *pContent = pParamData;
+		if ((pEntry->uiDataSize >= 12) && (*(UINT *)pParamData == 0x4D524150)) {
+			/* wrapped PARM buffer, the plain text starts at +8 */
+			pContent = pParamData + 8;
+		}
+		if ((strstr(pContent, "TYPE: GPT") != NULL) ||
+		    (strstr(pContent, "TYPE:GPT") != NULL)) {
+			if (!write_gpt_data(dev, pContent))
+				goto Exit_UpgradeFw;
+		}
+		bRet = write_param_data(dev, pParamData, pEntry->uiDataSize);
+		delete []pParamData;
+		pParamData = NULL;
+		if (!bRet)
+			goto Exit_UpgradeFw;
+		break;
+	}
+
+	/* 4. write idblock built from the embedded loader */
+	printf("Writing idblock...\r\n");
+	if (!upgrade_loader(dev, szImage))
+		goto Exit_UpgradeFw;
+
+	/* 5. reset the device */
+	bSuccess = reset_device(dev);
+	if (bSuccess)
+		printf("Upgrade firmware succeeded.\r\n");
+Exit_UpgradeFw:
+	if (pParamData)
+		delete []pParamData;
+	if (file)
+		fclose(file);
+	return bSuccess;
+}
+
+/*
+ * afp <update.img> -- parse an update firmware and print its partition
+ * items, no device needed. Handy for checking an image before flashing.
+ */
+bool print_af_info(char *szImage)
+{
+	FILE *file = NULL;
+	AF_ENTRY_VECTOR vecEntries;
+	STRUCT_RKAF_ENTRY *pEntry;
+	char *pParamData = NULL, *pCmdLine;
+	bool bSuccess = false;
+	long long fwOffset, fwSize;
+	UINT i;
+
+	if (!parse_update_image(szImage, file, fwOffset, fwSize, vecEntries))
+		goto Exit_PrintAf;
+
+	printf("RKFW header OK, firmware data at 0x%llX (%lld bytes)\r\n",
+	       (unsigned long long)fwOffset, fwSize);
+	printf("RKAF package parsed, %d item(s):\r\n", (int)vecEntries.size());
+	for (i = 0; i < (UINT)vecEntries.size(); i++) {
+		pEntry = &vecEntries[i];
+		if (pEntry->uiFlashOffset == 0xFFFFFFFF)
+			printf("  %-12s path=%-20s data=%u bytes, not for flash\r\n",
+			       pEntry->szName, pEntry->szPath, pEntry->uiDataSize);
+		else
+			printf("  %-12s path=%-20s flash LBA 0x%-7X partition 0x%X sectors, data=%u bytes\r\n",
+			       pEntry->szName, pEntry->szPath, pEntry->uiFlashOffset,
+			       pEntry->uiFlashSize, pEntry->uiDataSize);
+		if (strcasecmp(pEntry->szName, "parameter") != 0)
+			continue;
+		pParamData = new char[pEntry->uiDataSize + 1];
+		if (!pParamData)
+			continue;
+		fseeko(file, fwOffset + (long long)pEntry->uiDataOffset, SEEK_SET);
+		if (fread(pParamData, 1, pEntry->uiDataSize, file) != pEntry->uiDataSize) {
+			delete []pParamData;
+			pParamData = NULL;
+			continue;
+		}
+		pParamData[pEntry->uiDataSize] = 0;
+		/* the item may be a wrapped PARM buffer: "PARM" + size + text + crc */
+		if ((pEntry->uiDataSize >= 12) && (*(UINT *)pParamData == 0x4D524150))
+			pCmdLine = strstr(pParamData + 8, "CMDLINE");
+		else
+			pCmdLine = strstr(pParamData, "CMDLINE");
+		if (pCmdLine) {
+			char *pEnd = strchr(pCmdLine, '\n');
+			if (pEnd)
+				*pEnd = 0;
+			printf("  %s\r\n", pCmdLine);
+		}
+		delete []pParamData;
+		pParamData = NULL;
+	}
+	bSuccess = true;
+Exit_PrintAf:
+	if (pParamData)
+		delete []pParamData;
+	if (file)
+		fclose(file);
+	return bSuccess;
+}
+
 void split_item(STRING_VECTOR &vecItems, char *pszItems)
 {
 	string strItem;
@@ -3133,6 +3607,13 @@ bool handle_command(int argc, char* argv[], CRKScan *pScan)
 		}
 		printf("tagspl: parameter error\n");
 		usage();
+	} else if (strcmp(strCmd.c_str(), "AFP") == 0) {//parse update firmware, no device needed
+		if (argc == 3) {
+			print_af_info(argv[2]);
+			return true;
+		}
+		printf("afp: parameter error\n");
+		usage();
 	}
 	cnt = pScan->Search(RKUSB_MASKROM | RKUSB_LOADER);
 	if(strcmp(strCmd.c_str(), "LD") == 0) {
@@ -3240,6 +3721,13 @@ bool handle_command(int argc, char* argv[], CRKScan *pScan)
 			bSuccess = upgrade_loader(dev, (char *)strLoader.c_str());
 		} else
 			printf("Parameter of [UL] command is invalid, please check help!\r\n");
+	} else if(strcmp(strCmd.c_str(), "UF") == 0) {
+		if (argc > 2) {
+			string strImage;
+			strImage = argv[2];
+			bSuccess = upgrade_fw(dev, (char *)strImage.c_str());
+		} else
+			printf("Parameter of [UF] command is invalid, please check help!\r\n");
 	} else if(strcmp(strCmd.c_str(), "EF") == 0) {
 		if (argc == 2) {
 			bSuccess = erase_flash(dev);

@@ -32,6 +32,7 @@ bool CRKUsbComm::InitializeUsb(STRUCT_RKDEVICE_DESC devDesc)
 	m_pUsbHandle = NULL;
 	m_pipeBulkIn = m_pipeBulkOut = 0;
 	m_interfaceNum = -1;
+	m_usbError = 0;
 	if (!devDesc.pUsbHandle) {
 		return false;
 	}
@@ -39,6 +40,7 @@ bool CRKUsbComm::InitializeUsb(STRUCT_RKDEVICE_DESC devDesc)
 	int iRet;
 	iRet = libusb_open((libusb_device *)devDesc.pUsbHandle, (libusb_device_handle **)&m_pUsbHandle);
 	if (iRet!=0) {
+		m_usbError = iRet;
 		if (m_log) {
 			m_log->Record("Error:InitializeUsb-->open device failed,err=%d", iRet);
 		}
@@ -47,6 +49,7 @@ bool CRKUsbComm::InitializeUsb(STRUCT_RKDEVICE_DESC devDesc)
 	struct libusb_config_descriptor *pConfigDesc=NULL;
 	iRet = libusb_get_active_config_descriptor((libusb_device *)devDesc.pUsbHandle, &pConfigDesc);
 	if (iRet!=0) {
+		m_usbError = iRet;
 		if (m_log) {
 			m_log->Record("Error:InitializeUsb-->get device config descriptor failed, err=%d", iRet);
 		}
@@ -84,6 +87,7 @@ bool CRKUsbComm::InitializeUsb(STRUCT_RKDEVICE_DESC devDesc)
 					libusb_free_config_descriptor(pConfigDesc);
 					iRet = libusb_claim_interface((libusb_device_handle *)m_pUsbHandle, m_interfaceNum);
 					if (iRet != 0) {
+						m_usbError = iRet;
 						if (m_log) {
 					    	m_log->Record("Error:libusb_claim_interface failed,err=%d", iRet);
 					    }

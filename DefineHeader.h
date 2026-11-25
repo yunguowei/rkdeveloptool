@@ -128,6 +128,7 @@ typedef struct _STRUCT_RKDEVICE_DESC{
 	ENUM_RKUSB_TYPE emUsbType;
 	ENUM_RKDEVICE_TYPE emDeviceType;
 	void   *pUsbHandle;
+	UCHAR   ucHasStrings;	/* rockusb loader re-enumerates with string descriptors, maskrom has none */
 } STRUCT_RKDEVICE_DESC, *PSTRUCT_RKDEVICE_DESC;
 typedef	struct {
 	DWORD	dwTag;

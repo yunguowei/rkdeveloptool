@@ -257,6 +257,7 @@ void CRKScan::EnumerateUsbDevice(RKDEVICE_DESC_SET &list, UINT &uiTotalMatchDevi
 			desc.usbcdUsb = descriptor.bcdUSB;
 			desc.usVid = descriptor.idVendor;
 			desc.usPid = descriptor.idProduct;
+			desc.ucHasStrings = (descriptor.iManufacturer != 0) || (descriptor.iProduct != 0);
 			desc.uiLocationID = libusb_get_bus_number(dev);
 			desc.uiLocationID <<= 8;
 			desc.uiLocationID += libusb_get_port_number(dev);
@@ -332,7 +333,7 @@ int CRKScan::Search(UINT type)
 
 	if ( (type & RKUSB_MASKROM) == 0 ) {
 		for ( iter = m_list.begin(); iter != m_list.end(); ) {
-			if( (IsRockusbDevice(devType, (*iter).usVid, (*iter).usPid)) && (((*iter).usbcdUsb & 0x1) == 0) ) {
+			if( (IsRockusbDevice(devType, (*iter).usVid, (*iter).usPid)) && (((*iter).usbcdUsb & 0x1) == 0) && !(*iter).ucHasStrings ) {
 	            if ((*iter).pUsbHandle) {
 					libusb_unref_device((libusb_device *)((*iter).pUsbHandle));
 					(*iter).pUsbHandle = NULL;
@@ -394,7 +395,9 @@ int CRKScan::Search(UINT type)
 			USHORT usTemp;
 			usTemp = (*iter).usbcdUsb;
 			usTemp= usTemp & 0x1;
-			if ( usTemp == 0 )
+			/* RK3588 reports bcdUSB 2.00 in both modes; only the loader
+			 * carries string descriptors, the maskrom has none */
+			if ( (usTemp == 0) && !(*iter).ucHasStrings )
 				(*iter).emUsbType = RKUSB_MASKROM;
 			else
 				(*iter).emUsbType = RKUSB_LOADER;
@@ -520,7 +523,8 @@ bool CRKScan::Wait(STRUCT_RKDEVICE_DESC &device, ENUM_RKUSB_TYPE usbType, USHORT
 						continue;
 				}
 				if (IsRockusbDevice(devType, (*iter).usVid, (*iter).usPid)) {
-					if ( ((*iter).usbcdUsb & 0x0001) == 0 )
+					/* same RK3588 caveat: loader has string descriptors, maskrom does not */
+					if ( (((*iter).usbcdUsb & 0x0001) == 0) && !(*iter).ucHasStrings )
 						curDeviceType = RKUSB_MASKROM;
 					else
 						curDeviceType = RKUSB_LOADER;
